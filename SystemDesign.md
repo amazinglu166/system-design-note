@@ -3287,6 +3287,344 @@ val session = MediaSession.Builder(context, player)
 
 ---
 
+## 14. Mobile Metrics Collection (TikTok Shopping Foundation)
+
+Collect metrics for user interactions
+
+### Phase 1: Requirement Clarification
+
+**Functional Requirements:**
+- **Foundational SDK**: a shared API that any feature team can integrate — shopping, feed, live, etc.
+- **Flexible metadata**: able to collect different event types with arbitrary key-value metadata (tap, scroll, impression, purchase, page view, error, etc.)
+- **Manual instrumentation**: feature teams call `MetricsCollector.track(event)` for custom business events
+
+**Non-Functional Requirements:**
+- **Maximize collection**: collect as much as possible — dropping events is acceptable only under extreme pressure (battery/storage)
+- **Minimal impact**: collection must not block UI thread or degrade scroll performance
+- **Batching & compression**: events are batched and compressed before upload to reduce network usage
+- **Offline resilience**: events survive app kill, process death, and no-network periods
+- **Deduplication**: server-side dedup via event IDs — safe to retry uploads
+
+**Things Interviewers Leave Ambiguous on Purpose:**
+- How large can the local queue grow before dropping?
+- Should events be sampled on high-traffic screens?
+- Real-time vs near-real-time delivery expectations
+- Privacy: which fields need scrubbing before upload?
+
+### Phase 2: Data Model
+
+```
+MetricEvent {
+  eventId: String               // UUID — used for dedup
+  eventType: String             // "impression", "tap", "purchase", "page_view", "error"
+  timestamp: Long               // epoch millis, captured at event time
+  sessionId: String             // links events within a single user session
+  userId: String?               // null if logged out
+  metadata: Map<String, Any>    // arbitrary KV pairs — feature teams add what they need
+                                // value type can be a Proto (protobuf) so the schema is shared
+                                // across platforms (Android, iOS, web) and enforced at compile time
+}
+
+EventBatch {
+  batchId: String
+  events: List<MetricEvent>
+  createdAt: Long
+  retryCount: Int               // track how many times this batch was attempted
+}
+
+SessionInfo {
+  sessionId: String
+  startTime: Long
+  deviceInfo: DeviceInfo        // OS version, device model, app version, locale
+}
+
+DeviceInfo {
+  osVersion: String             // e.g. "Android 14"
+  deviceModel: String           // e.g. "Pixel 8"
+  appVersion: String            // e.g. "23.4.1"
+  locale: String                // e.g. "en_US"
+  networkType: String           // "wifi", "cellular", "none"
+}
+```
+
+### Phase 3: API Design
+
+```
+// Single batch upload endpoint
+POST /v1/metrics/batch
+Headers: Content-Encoding: gzip, X-Idempotency-Key: {batchId}
+Body: {
+  batchId: String,
+  sessionInfo: SessionInfo,
+  events: [MetricEvent]
+}
+Response: { accepted: Int, duplicates: Int }
+```
+
+**Why POST not PUT?** Each batch is a new resource (append-only log). Idempotency handled via `batchId` header, so retries are safe.
+
+### Phase 4: Mobile Architecture
+
+**Presentation Layer — Auto-capture Setup**
+
+```kotlin
+// Feature teams integrate with one line:
+MetricsCollector.track(
+    eventType = "tap_add_to_cart",
+    screenName = "ProductDetail",
+    metadata = mapOf("productId" to "p_123", "price" to 29.99)
+)
+
+// Impression tracking via LazyColumn
+@Composable
+fun TrackImpression(eventType: String, metadata: Map<String, Any>, content: @Composable () -> Unit) {
+    val visible = remember { mutableStateOf(false) }
+    Box(modifier = Modifier.onGloballyPositioned {
+        // check if >50% visible for >1 second
+    }) {
+        content()
+    }
+    LaunchedEffect(visible.value) {
+        if (visible.value) {
+            delay(1000) // 1s dwell threshold — only count impression if item was
+                        // visible for ≥1s. Prevents fast-scroll fly-bys from inflating metrics.
+                        // If user scrolls away before 1s, LaunchedEffect cancels (key changed),
+                        // so track() never fires.
+            MetricsCollector.track(eventType, metadata = metadata)
+        }
+    }
+}
+```
+
+**Domain Layer — MetricsCollector (Singleton SDK)**
+
+Two-tier storage: **in-memory Channel → Room (individual events) → batch from Room → WorkManager upload**
+
+```kotlin
+object MetricsCollector {
+
+    private val eventChannel = Channel<MetricEvent>(capacity = Channel.BUFFERED)
+    private val sessionId: String = UUID.randomUUID().toString()
+    private const val BUFFER_FLUSH_SIZE = 20
+    private const val BUFFER_TIMEOUT_MS = 5_000L  // flush partial buffer after 5s of no new events
+    private const val FLUSH_INTERVAL_MS = 30_000L
+    // Option A: ProcessLifecycleOwner.get().lifecycleScope
+    //   + No setup — just works out of the box
+    //   + Automatically tied to app process lifetime (ON_DESTROY never fires)
+    //   - Couples SDK to Android lifecycle APIs — can't use in pure Kotlin/KMP modules
+    //   - Hard to test — need Robolectric or instrumented tests to get a real LifecycleOwner
+    //
+    // Option B (recommended): Inject a singleton CoroutineScope
+    //   + Testable — swap with TestScope in unit tests
+    //   + Decoupled — no Android dependency, works in pure Kotlin / KMP modules
+    //   + Caller controls dispatcher and SupervisorJob policy
+    //   - Requires DI setup or manual init
+    //   - Caller must ensure the scope lives long enough (app-level, not Activity-level)
+    private lateinit var scope: CoroutineScope
+
+    // Provide via Hilt:
+    @Module @InstallIn(SingletonComponent::class)
+    object CoroutineScopeModule {
+         @Provides @Singleton
+         fun provideAppScope(): CoroutineScope = CoroutineScope(SupervisorJob())
+             // SupervisorJob: if one child coroutine fails (e.g. a single batch upload crashes),
+             // it does NOT cancel sibling coroutines (e.g. the channel drain loop keeps running).
+             // With a regular Job, one failure would cancel everything — the whole SDK stops collecting.
+    }
+
+    fun init(context: Context, scope: CoroutineScope) {
+        this.scope = scope
+
+        // Drain channel → batch-insert to Room using `select`
+        // select waits for EITHER a new event OR a timeout — whichever fires first
+        // No race condition on buffer: select runs EXACTLY ONE branch per iteration.
+        // The other branch is skipped entirely — they never run concurrently.
+        //   Iteration 1: item arrives   → onReceive runs  (onTimeout skipped)
+        //   Iteration 2: item arrives   → onReceive runs  (onTimeout skipped)
+        //   Iteration 3: 5s no item     → onTimeout runs  (onReceive skipped)
+        //
+        // Why not chunked()? chunked() only emits when buffer is full.
+        // On a hot flow (Channel), partial buffers sit in memory forever if events
+        // trickle in slowly. We need time-based flushing too.
+        //
+        // NOTE: no sampling here — sampling is the feature team's responsibility, not the SDK's.
+        scope.launch(Dispatchers.IO) {
+            val buffer = mutableListOf<MetricEventEntity>()
+
+            while (true) {
+                select {
+                    eventChannel.onReceive { event ->
+                        buffer.add(event.toEntity())
+                        if (buffer.size >= BUFFER_FLUSH_SIZE) {
+                            eventDao.insertAll(buffer.toList())
+                            buffer.clear()
+                        }
+                    }
+                    onTimeout(BUFFER_TIMEOUT_MS) {
+                        if (buffer.isNotEmpty()) {
+                            eventDao.insertAll(buffer.toList())
+                            buffer.clear()
+                        }
+                    }
+                }
+            }
+        }
+
+        // WorkManager periodic task handles upload on its own schedule
+        // No in-process flush loop needed — WorkManager survives process death
+        MetricsUploadWorker.enqueuePeriodicFlush(context, FLUSH_INTERVAL_MS)
+    }
+
+    fun track(eventType: String, screenName: String = "", metadata: Map<String, Any> = emptyMap()) {
+        val event = MetricEvent(
+            eventId = UUID.randomUUID().toString(),
+            eventType = eventType,
+            timestamp = System.currentTimeMillis(),
+            sessionId = sessionId,
+            userId = UserManager.currentUserId,
+            screenName = screenName,
+            metadata = metadata
+        )
+        eventChannel.trySend(event) // non-blocking, never blocks UI thread
+    }
+
+    // Optional: trigger an immediate flush (e.g., on app background)
+    // Runs a one-time WorkManager task outside the periodic schedule
+    fun flushNow() {
+        val request = OneTimeWorkRequestBuilder<MetricsUploadWorker>()
+            .setConstraints(Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build())
+            .build()
+        WorkManager.getInstance(context).enqueue(request)
+    }
+}
+```
+
+**Data Access Layer — Persistence & Upload**
+
+```kotlin
+// --- Individual event storage (tier 1: immediate persistence) ---
+
+@Entity
+data class MetricEventEntity(
+    @PrimaryKey val eventId: String,
+    val eventType: String,
+    val timestamp: Long,
+    val sessionId: String,
+    val userId: String?,
+    val screenName: String,
+    val metadataJson: String      // serialized Map<String, Any>
+)
+
+@Dao
+interface MetricEventDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(events: List<MetricEventEntity>)  // batch insert — single transaction
+
+    @Query("SELECT * FROM MetricEventEntity ORDER BY timestamp ASC LIMIT :limit")
+    suspend fun getOldest(limit: Int): List<MetricEventEntity>
+
+    @Query("DELETE FROM MetricEventEntity WHERE eventId IN (:ids)")
+    suspend fun deleteByIds(ids: List<String>)
+}
+
+// WorkManager worker — read from Room → upload → delete
+// No batch table needed — just query events directly
+// Mutex ensures only one upload runs at a time, even if periodic + flushNow() overlap
+class MetricsUploadWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+
+    companion object {
+        // Shared Mutex across all worker instances — prevents concurrent getOldest/deleteByIds
+        // from reading the same events when periodic and one-time workers overlap.
+        //
+        // Simpler alternative: remove flushNow() entirely and only use periodic workers.
+        // Then no Mutex is needed since enqueueUniquePeriodicWork(KEEP) guarantees
+        // only one periodic worker runs at a time. Prefer this simpler approach unless
+        // immediate flush (e.g. on purchase) is a hard requirement.
+        private val uploadMutex = Mutex()
+    }
+
+    override suspend fun doWork(): Result = uploadMutex.withLock {
+        val events = eventDao.getOldest(limit = UPLOAD_BATCH_SIZE)
+        if (events.isEmpty()) return@withLock Result.success()
+
+        try {
+            val payload = Json.encodeToString(events) // optional: gzip for 5-10x size reduction
+            metricsApi.uploadBatch(UUID.randomUUID().toString(), payload)
+            eventDao.deleteByIds(events.map { it.eventId })
+            Result.success()
+        } catch (e: Exception) {
+            Result.retry() // WorkManager handles exponential backoff
+        }
+    }
+
+    companion object {
+        fun enqueuePeriodicFlush(context: Context, intervalMs: Long) {
+            val request = PeriodicWorkRequestBuilder<MetricsUploadWorker>(
+                    intervalMs, TimeUnit.MILLISECONDS
+                )
+                .setConstraints(Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build())
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
+                .build()
+            WorkManager.getInstance(context)
+                .enqueueUniquePeriodicWork("metrics_flush", ExistingPeriodicWorkPolicy.KEEP, request)
+        }
+    }
+}
+```
+
+**Architecture Diagram:**
+
+```
+Feature Teams (Shopping, Feed, Live ...)
+         │
+         │  MetricsCollector.track(event)
+         ▼
+┌──────────────────────────────┐
+│   MetricsCollector           │  ← Singleton, non-blocking Channel
+│   (in-memory Channel)       │
+│         │                    │
+│         │ chunked(N)         │
+│         ▼                    │
+│   Room: MetricEventEntity    │  ← Batch-insert, survives process death
+│                              │
+│ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ │  ← WorkManager periodic boundary
+│                              │
+│   WorkManager (periodic)     │  ← Runs every flushIntervalMs
+│     1. read oldest N events  │
+│     2. gzip + upload         │     POST /metrics/batch
+│     3. delete uploaded by id │     on success only
+│     (retry on failure)       │     exponential backoff
+└──────────────────────────────┘
+```
+
+**Key Trade-offs:**
+
+| Decision | Option A | Option B | Recommendation |
+|----------|----------|----------|----------------|
+| Buffering | In-memory only | Room DB | Room — survives process death, critical for "collect as much as possible". Single table, no separate batch table — just read N events, upload, delete by ID |
+| Upload trigger | Time-based only (every 30s) | Time + size (30s or 50 events) | Both — prevents lag on busy screens, prevents stale events on idle screens |
+| Serialization | JSON | Protobuf | JSON for simplicity in SDK; protobuf if bandwidth is a real constraint |
+| Compression | None | gzip | gzip — typical 5-10x reduction on JSON event payloads |
+| Sampling | SDK-level (hidden) | Feature-team-level (explicit) | Feature team — SDK should not silently drop events; hidden filtering causes confusing data loss for teams debugging their metrics |
+| Queue overflow | Drop oldest | Drop newest | Drop oldest — newer events are more valuable for debugging |
+| Threading | Coroutine Channel | HandlerThread | Channel — structured concurrency, backpressure built in |
+| Worker | WorkManager | AlarmManager + Service | WorkManager — handles doze, battery optimization, guaranteed execution |
+
+**Gotchas:**
+- **UI thread safety**: `track()` must never block. Use `Channel.trySend()` (non-suspending) not `send()` (suspending)
+- **Battery drain**: don't flush too frequently. 30s interval is a good default. Flush immediately on `onStop` lifecycle
+- **Storage cap**: if Room grows beyond `maxQueueSize`, drop oldest batches. Prevent unbounded disk usage
+- **Impression dedup**: same item scrolled in/out multiple times — dedup by `(eventType, itemId, sessionId)` within a time window
+- **Privacy**: scrub PII before storing to Room. Don't log user input text as metadata
+- **Config caching**: cache the metrics config locally with a TTL (e.g., 1 hour). Don't block event collection if config fetch fails — use defaults
+- **Process death during flush**: batch is already in Room before WorkManager starts, so no data loss. WorkManager re-enqueues on restart
+
+
+
 ## Appendix: Common MIME Types Reference
 
 **Images**
